@@ -13,21 +13,40 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Rate Limiter tracking map
-var visitors = make(map[string]*rate.Limiter)
+type visitor struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+var visitors = make(map[string]*visitor)
 var mtx sync.Mutex
 
 func getVisitor(ip string) *rate.Limiter {
 	mtx.Lock()
 	defer mtx.Unlock()
 
-	limiter, exists := visitors[ip]
+	v, exists := visitors[ip]
 	if !exists {
-		// Allow 2 requests per second, with a burst capacity of 5
-		limiter = rate.NewLimiter(2, 5)
-		visitors[ip] = limiter
+		limiter := rate.NewLimiter(2, 5)
+		visitors[ip] = &visitor{limiter, time.Now()}
+		return limiter
 	}
-	return limiter
+	v.lastSeen = time.Now()
+	return v.limiter
+}
+
+// Add this function to clear old IPs
+func cleanupVisitors() {
+	for {
+		time.Sleep(time.Minute)
+		mtx.Lock()
+		for ip, v := range visitors {
+			if time.Since(v.lastSeen) > 3*time.Minute {
+				delete(visitors, ip)
+			}
+		}
+		mtx.Unlock()
+	}
 }
 
 func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -86,11 +105,13 @@ func main() {
 	db.SetConnMaxLifetime(5 * time.Minute) // Cycle connections safely
 
 	initDB()
+	StartMaintenanceEngine() // Ignite the background clustering engine
 
 	// Apply the middleware to your endpoints
 	http.HandleFunc("/api/submit", rateLimitMiddleware(submitFingerprintHandler))
 	http.HandleFunc("/api/report", rateLimitMiddleware(reportSkipHandler))
 	http.HandleFunc("/api/skips", rateLimitMiddleware(getSkipsHandler))
+	http.HandleFunc("/api/upvote", rateLimitMiddleware(upvoteSkipHandler))
 	// Create a hardened server with timeouts
 	server := &http.Server{
 		Addr:         ":8080",
@@ -100,6 +121,7 @@ func main() {
 	}
 
 	log.Println("Go Server running on http://localhost:8080")
+	go cleanupVisitors()
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -130,6 +152,19 @@ func initDB() {
 		PRIMARY KEY (client_id, episode_id, timestamp_ms)
 	);`
 
+	queryUpvotes := `
+	CREATE TABLE IF NOT EXISTS upvotes (
+		client_id TEXT NOT NULL,
+		episode_id TEXT NOT NULL,
+		timestamp_ms INTEGER NOT NULL,
+		PRIMARY KEY (client_id, episode_id, timestamp_ms)
+	);`
+	queryLogs := `
+	CREATE TABLE IF NOT EXISTS submission_logs (
+		client_id TEXT NOT NULL,
+		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+
 	if _, err := db.Exec(queryFingerprints); err != nil {
 		log.Fatalf("Failed to create ad_fingerprints table: %v", err)
 	}
@@ -138,6 +173,12 @@ func initDB() {
 	}
 	if _, err := db.Exec(queryReports); err != nil {
 		log.Fatalf("Failed to create reports table: %v", err)
+	}
+	if _, err := db.Exec(queryUpvotes); err != nil {
+		log.Fatalf("Failed to create upvotes table: %v", err)
+	}
+	if _, err := db.Exec(queryLogs); err != nil {
+		log.Fatalf("Failed to create submission_logs table: %v", err)
 	}
 }
 
@@ -153,9 +194,37 @@ func submitFingerprintHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Time-based Clustering (Tolerance: 10 seconds)
+	// NEW: Cap maximum duration to 10 minutes (600,000ms)
+	if sub.SkipDurationMs > 600000 {
+		http.Error(w, "Duration exceeds maximum allowed", http.StatusBadRequest)
+		return
+	}
+
+	// ---> NEW: 1. Check daily submission limit <---
+	var recentSubmissions int
+	limitQuery := `
+		SELECT COUNT(*) FROM submission_logs 
+		WHERE client_id = ? AND timestamp >= datetime('now', '-1 day')`
+
+	err := db.QueryRow(limitQuery, sub.ClientID).Scan(&recentSubmissions)
+	if err != nil {
+		log.Printf("Error checking rate limit: %v", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	if recentSubmissions >= 20 {
+		log.Printf("Blocked client %s: Exceeded 20 submissions per day.", sub.ClientID)
+		http.Error(w, "Daily submission limit reached.", http.StatusTooManyRequests)
+		return
+	}
+	// ----------------------------------------------
+
+	// 2. Time-based Clustering (Tolerance: 10 seconds)
 	const timeToleranceMs = 10000
-	rows, err := db.Query("SELECT id, timestamp_ms, skip_duration_ms FROM ad_fingerprints WHERE episode_id = ?", sub.EpisodeID)
+
+	// NEW: We must fetch trust_score to perform the weighted average
+	rows, err := db.Query("SELECT id, timestamp_ms, skip_duration_ms, trust_score FROM ad_fingerprints WHERE episode_id = ?", sub.EpisodeID)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -165,22 +234,24 @@ func submitFingerprintHandler(w http.ResponseWriter, r *http.Request) {
 	var matchedID int
 	var existingDuration int
 	var existingTimestamp int
+	var existingTrust int
 	var shortestDistance = math.MaxInt32
 
 	for rows.Next() {
-		var dbID, dbTimestamp, dbDuration int
-		if err := rows.Scan(&dbID, &dbTimestamp, &dbDuration); err == nil {
+		var dbID, dbTimestamp, dbDuration, dbTrust int
+		if err := rows.Scan(&dbID, &dbTimestamp, &dbDuration, &dbTrust); err == nil {
 			dist := int(math.Abs(float64(sub.TimestampMs - dbTimestamp)))
 			if dist < timeToleranceMs && dist < shortestDistance {
 				shortestDistance = dist
 				matchedID = dbID
 				existingTimestamp = dbTimestamp
 				existingDuration = dbDuration
+				existingTrust = dbTrust // Capture the weight
 			}
 		}
 	}
 
-	// 2. Prevent Duplicate Votes on this specific cluster
+	// 3. Prevent Duplicate Votes on this specific cluster
 	targetTimestamp := sub.TimestampMs
 	if matchedID != 0 {
 		targetTimestamp = existingTimestamp
@@ -194,17 +265,22 @@ func submitFingerprintHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Update Cluster or Insert New
+	// 4. Update Cluster or Insert New
 	if matchedID != 0 {
-		newDuration := (existingDuration + sub.SkipDurationMs) / 2
-		updateQuery := `UPDATE ad_fingerprints SET trust_score = trust_score + 1, skip_duration_ms = ? WHERE id = ?`
-		_, err = db.Exec(updateQuery, newDuration, matchedID)
-		log.Printf("Clustered into ad ID %d (Time Diff: %dms)", matchedID, shortestDistance)
+		// ---> NEW: Live Weighted Average Math <---
+		newTrust := existingTrust + 1
+		newTimestamp := ((existingTimestamp * existingTrust) + sub.TimestampMs) / newTrust
+		newDuration := ((existingDuration * existingTrust) + sub.SkipDurationMs) / newTrust
+
+		updateQuery := `UPDATE ad_fingerprints SET timestamp_ms = ?, skip_duration_ms = ?, trust_score = ? WHERE id = ?`
+		_, err = db.Exec(updateQuery, newTimestamp, newDuration, newTrust, matchedID)
+		log.Printf("Clustered into ad ID %d. New Start: %d, New Duration: %d", matchedID, newTimestamp, newDuration)
 	} else {
 		insertQuery := `INSERT INTO ad_fingerprints (episode_id, timestamp_ms, fingerprint, trust_score, skip_duration_ms) VALUES (?, ?, ?, 1, ?)`
 		_, err = db.Exec(insertQuery, sub.EpisodeID, sub.TimestampMs, sub.Fingerprint, sub.SkipDurationMs)
 		log.Printf("Created new ad cluster for episode %s at %dms", sub.EpisodeID, sub.TimestampMs)
 	}
+	// -------------------------------------------------------------
 
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte(`{"status":"success"}`))
@@ -292,6 +368,44 @@ func reportSkipHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Successfully processed report for episode %s at %dms", payload.EpisodeID, payload.TimestampMs)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"success"}`))
+}
+
+func upvoteSkipHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload ReportPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.ClientID == "" || payload.EpisodeID == "" {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	// 1. Prevent duplicate upvotes from the same device
+	upvoteQuery := `INSERT INTO upvotes (client_id, episode_id, timestamp_ms) VALUES (?, ?, ?)`
+	if _, err := db.Exec(upvoteQuery, payload.ClientID, payload.EpisodeID, payload.TimestampMs); err != nil {
+		log.Printf("Blocked duplicate upvote from client: %s", payload.ClientID)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ignored_duplicate"}`))
+		return
+	}
+
+	// 2. Increment the trust score using temporal proximity (10-second tolerance)
+	incrementQuery := `
+	UPDATE ad_fingerprints 
+	SET trust_score = trust_score + 1 
+	WHERE episode_id = ? AND ABS(timestamp_ms - ?) < 10000`
+
+	if _, err := db.Exec(incrementQuery, payload.EpisodeID, payload.TimestampMs); err != nil {
+		log.Printf("DB Update Error: %v", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Successfully processed upvote for episode %s at %dms", payload.EpisodeID, payload.TimestampMs)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"success"}`))
 }
