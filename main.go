@@ -393,6 +393,22 @@ func upvoteSkipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// NEW: Prevent the original submitter from upvoting their own skip
+	var isSubmitter bool
+	checkSubmitterQuery := `
+		SELECT EXISTS(
+			SELECT 1 FROM votes 
+			WHERE client_id = ? AND episode_id = ? AND ABS(timestamp_ms - ?) < 10000
+		)`
+
+	err := db.QueryRow(checkSubmitterQuery, payload.ClientID, payload.EpisodeID, payload.TimestampMs).Scan(&isSubmitter)
+	if err == nil && isSubmitter {
+		log.Printf("Blocked self-upvote from client: %s", payload.ClientID)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ignored_self_upvote"}`))
+		return
+	}
+
 	// 2. Increment the trust score using temporal proximity (10-second tolerance)
 	incrementQuery := `
 	UPDATE ad_fingerprints 
